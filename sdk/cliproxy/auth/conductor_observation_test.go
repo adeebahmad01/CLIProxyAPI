@@ -238,6 +238,68 @@ func TestRefreshAuthForObservationRejectsCredentialScopeReplacement(t *testing.T
 
 type observationFailureStore struct{ persistFailureStore }
 
+func TestRefreshAuthForObservationCommitsDespiteRequestCancellation(t *testing.T) {
+	for _, stage := range []string{"during refresh", "during persistence"} {
+		t.Run(stage, func(t *testing.T) {
+			type contextKey struct{}
+			ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "observation-value"))
+			defer cancel()
+
+			store := &refreshCommitStore{
+				memoryAuthTestStore: newMemoryAuthTestStore(),
+				checkContext: func(commitCtx context.Context) {
+					if stage == "during persistence" {
+						cancel()
+					}
+					if commitCtx.Err() != nil || commitCtx.Done() != nil {
+						t.Error("successful observation refresh commit inherited request cancellation")
+					}
+					if _, ok := commitCtx.Deadline(); ok {
+						t.Error("successful observation refresh commit inherited a deadline")
+					}
+					if commitCtx.Value(contextKey{}) != "observation-value" {
+						t.Error("observation refresh commit lost context values")
+					}
+				},
+			}
+			manager := NewManager(store, nil, nil)
+			exec := &observationRefreshExecutor{countingRefreshExecutor: countingRefreshExecutor{id: "claude"}}
+			if stage == "during refresh" {
+				exec.mutate = func(*Auth) { cancel() }
+			}
+			manager.RegisterExecutor(exec)
+			auth, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{
+				ID: "observation", Provider: "claude",
+				Metadata: map[string]any{
+					"access_token": "synthetic-expired-token", "refresh_token": "synthetic-refresh",
+					"expired": "2000-01-01T00:00:00Z",
+				},
+			})
+			if errRegister != nil {
+				t.Fatal(errRegister)
+			}
+
+			refreshed, rotated, errRefresh := manager.RefreshAuthForObservation(ctx, auth)
+			if errRefresh != nil {
+				t.Fatalf("refresh observation after cancellation: %v", errRefresh)
+			}
+			if !rotated || ctx.Err() != context.Canceled {
+				t.Fatal("expected successful rotation despite a canceled request")
+			}
+			current, _ := manager.GetByID(auth.ID)
+			store.mu.Lock()
+			persisted := store.auths[auth.ID].Clone()
+			store.mu.Unlock()
+			for name, got := range map[string]*Auth{"result": refreshed, "manager": current, "store": persisted} {
+				if got == nil || authAccessToken(got) != "synthetic-rotated-token" ||
+					authRefreshToken(got) != "synthetic-rotated-refresh" {
+					t.Errorf("%s did not retain the successfully rotated credentials", name)
+				}
+			}
+		})
+	}
+}
+
 func (*observationFailureStore) Save(_ context.Context, auth *Auth) (string, error) {
 	return "", errors.New("store echoed " + authAccessToken(auth) + " " + authRefreshToken(auth))
 }

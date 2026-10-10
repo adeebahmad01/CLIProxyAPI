@@ -52,7 +52,9 @@ func (m *Manager) RefreshAuthForObservation(ctx context.Context, snapshot *Auth)
 	if !observationCredentialScopeMatches(current, updated, true) {
 		return nil, false, errors.New("observation credential refresh changed scope")
 	}
-	refreshed, errUpdate := m.updateInternal(ctx, current, updated, updateModeObservation)
+	// A successful exchange may invalidate the old refresh token, so commit
+	// the rotated credentials even if the observation request was canceled.
+	refreshed, errUpdate := m.updateInternal(context.WithoutCancel(ctx), current, updated, updateModeObservation)
 	if errUpdate != nil {
 		return nil, false, errUpdate
 	}
